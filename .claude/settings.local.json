@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(go mod tidy)",
+      "Bash(go build -o gitwt)",
+      "Bash(go doc github.com/charmbracelet/bubbles/filepicker | head -80)",
+      "Bash(go doc github.com/charmbracelet/bubbles/filepicker.Model)",
+      "Bash(./gitwt --help 2>&1 || true)"
+    ]
+  }
+}
