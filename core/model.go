@@ -1,14 +1,17 @@
 package core
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
+	"github.com/charmbracelet/bubbles/filepicker"
+	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
-	"github.com/charmbracelet/bubbles/filepicker"
 )
 
 // Worktree represents a git worktree
@@ -17,6 +20,16 @@ type Worktree struct {
 	Path   string
 	Clean  bool
 	IsMain bool
+}
+
+// MergeHistory represents a merge operation record
+type MergeHistory struct {
+	ID        string `json:"id"`
+	Project   string `json:"project"`
+	Source    string `json:"source"`
+	Target    string `json:"target"`
+	Pushed    bool   `json:"pushed"`
+	Timestamp string `json:"timestamp"`
 }
 
 // Model represents the application state
@@ -36,6 +49,12 @@ type Model struct {
 	Err             error
 	ShowFilePicker  bool
 	FilePicker      filepicker.Model
+	PathInput       textinput.Model
+	MergeDialogStep int            // 0=select source, 1=select target
+	MergeDialogIdx  int            // current selection index in merge dialog
+	History         []MergeHistory // merge history
+	HistoryIdx      int            // selected history index
+	ShowHistory     bool           // show history panel
 }
 
 // Init implements tea.Model
@@ -46,12 +65,35 @@ func (m Model) Init() tea.Cmd {
 	home, _ := os.UserHomeDir()
 	fp.CurrentDirectory = home
 	m.FilePicker = fp
+
+	// Initialize path input
+	ti := textinput.New()
+	ti.Placeholder = "/path/to/git/repo"
+	ti.Focus()
+	m.PathInput = ti
+
 	return nil
 }
 
 // Update implements tea.Model
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
-	// Handle file picker updates when shown
+	// Handle path input when add dialog is shown
+	if m.ShowAddDialog {
+		m.PathInput, _ = m.PathInput.Update(msg)
+		m.NewProjectPath = m.PathInput.Value()
+	}
+
+	switch msg := msg.(type) {
+	case tea.KeyMsg:
+		var cmd tea.Cmd
+		newModel, cmd := m.handleKeyMsg(msg)
+		m = newModel.(Model)
+		return m, cmd
+	case tea.WindowSizeMsg:
+		return m, nil
+	}
+
+	// Handle file picker updates when shown (after handleKeyMsg may have set it)
 	if m.ShowFilePicker {
 		// Handle key events for dialog control
 		if keyMsg, ok := msg.(tea.KeyMsg); ok {
@@ -65,18 +107,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.FilePicker.Path != "" {
 			// File/directory was selected
 			m.NewProjectPath = m.FilePicker.Path
+			m.PathInput.SetValue(m.FilePicker.Path)
 			m.ShowFilePicker = false
 			m.FilePicker.Path = "" // Reset for next time
 		}
 		return m, cmd
 	}
 
-	switch msg := msg.(type) {
-	case tea.KeyMsg:
-		return m.handleKeyMsg(msg)
-	case tea.WindowSizeMsg:
-		return m, nil
-	}
 	return m, nil
 }
 
@@ -122,9 +159,9 @@ var (
 				Foreground(accentColor)
 
 	dialogBaseStyle = lipgloss.NewStyle().
-				Background(backgroundColor).
-				Border(lipgloss.RoundedBorder()).
-				Padding(2)
+			Background(backgroundColor).
+			Border(lipgloss.RoundedBorder()).
+			Padding(2)
 )
 
 func (m Model) handleKeyMsg(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -143,7 +180,22 @@ func (m Model) handleKeyMsg(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.ShowAddDialog {
 			// Don't navigate in dialog
 		} else if m.ShowMergeDialog {
-			// Navigate in merge dialog
+			branches := m.getAllBranches()
+			// Filter out source branch if in step 1
+			if m.MergeDialogStep == 1 {
+				var filtered []string
+				for _, b := range branches {
+					if b != m.MergeSource {
+						filtered = append(filtered, b)
+					}
+				}
+				branches = filtered
+			}
+			if len(branches) > 0 {
+				m.MergeDialogIdx = (m.MergeDialogIdx + 1) % len(branches)
+			}
+		} else if m.ShowHistory && len(m.History) > 0 {
+			m.HistoryIdx = (m.HistoryIdx + 1) % len(m.History)
 		} else if m.FocusedPanel == "projects" {
 			if m.SelectedIndex < len(m.Projects)-1 {
 				m.SelectedIndex++
@@ -153,15 +205,38 @@ func (m Model) handleKeyMsg(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.SelectedIndex = (m.SelectedIndex + 1) % len(m.Projects)
 		}
 	case "k", "up":
-		if m.ShowAddDialog || m.ShowMergeDialog || m.ShowPushPrompt {
+		if m.ShowAddDialog || m.ShowPushPrompt {
 			// Don't navigate in dialog
+		} else if m.ShowMergeDialog {
+			branches := m.getAllBranches()
+			// Filter out source branch if in step 1
+			if m.MergeDialogStep == 1 {
+				var filtered []string
+				for _, b := range branches {
+					if b != m.MergeSource {
+						filtered = append(filtered, b)
+					}
+				}
+				branches = filtered
+			}
+			if len(branches) > 0 {
+				m.MergeDialogIdx--
+				if m.MergeDialogIdx < 0 {
+					m.MergeDialogIdx = len(branches) - 1
+				}
+			}
+		} else if m.ShowHistory && len(m.History) > 0 {
+			m.HistoryIdx--
+			if m.HistoryIdx < 0 {
+				m.HistoryIdx = len(m.History) - 1
+			}
 		} else if m.FocusedPanel == "projects" {
 			if m.SelectedIndex > 0 {
 				m.SelectedIndex--
 				m.loadWorktrees()
 			}
 		}
-	case "left", "h":
+	case "left":
 		if !m.ShowAddDialog && !m.ShowMergeDialog && !m.ShowPushPrompt {
 			m.FocusedPanel = "projects"
 		}
@@ -176,15 +251,15 @@ func (m Model) handleKeyMsg(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.executeMerge()
 		} else if m.ShowPushPrompt {
 			m.handlePushResponse()
-		}
-	case "tab":
-		if m.ShowAddDialog && !m.ShowFilePicker {
-			m.ShowFilePicker = true
+		} else if m.ShowHistory && len(m.History) > 0 {
+			m.replayMerge()
 		}
 	case "n":
 		if !m.ShowAddDialog && !m.ShowMergeDialog && !m.ShowPushPrompt {
 			m.ShowAddDialog = true
 			m.NewProjectPath = ""
+			m.PathInput.SetValue("")
+			m.PathInput.Focus()
 		}
 	case "d":
 		if !m.ShowAddDialog && !m.ShowMergeDialog && !m.ShowPushPrompt && m.FocusedPanel == "projects" && len(m.Projects) > 0 {
@@ -195,12 +270,19 @@ func (m Model) handleKeyMsg(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.ShowMergeDialog = true
 			m.MergeSource = ""
 			m.MergeTarget = ""
+			m.MergeDialogStep = 0
+			m.MergeDialogIdx = 0
 			m.Message = "Select source branch"
 		}
 	case "r":
 		if !m.ShowAddDialog && !m.ShowMergeDialog && !m.ShowPushPrompt {
 			m.loadWorktrees()
 			m.Message = "Refreshed"
+		}
+	case "h":
+		if !m.ShowAddDialog && !m.ShowMergeDialog && !m.ShowPushPrompt {
+			m.ShowHistory = !m.ShowHistory
+			m.HistoryIdx = 0
 		}
 	case "y":
 		if m.ShowPushPrompt {
@@ -299,37 +381,43 @@ func (m *Model) loadWorktrees() {
 }
 
 func (m *Model) executeMerge() {
-	if m.MergeSource == "" {
-		// Show branch selection - first select source
-		branches := m.getAllBranches()
-		if len(branches) == 0 {
-			m.Message = "No branches found"
+	branches := m.getAllBranches()
+	if len(branches) == 0 {
+		m.Message = "No branches found"
+		return
+	}
+
+	// Ensure index is valid
+	if m.MergeDialogIdx < 0 || m.MergeDialogIdx >= len(branches) {
+		m.MergeDialogIdx = 0
+	}
+
+	selectedBranch := branches[m.MergeDialogIdx]
+
+	if m.MergeDialogStep == 0 {
+		// First step: select source branch
+		m.MergeSource = selectedBranch
+		m.MergeDialogStep = 1
+		m.MergeDialogIdx = 0
+		m.Message = "Select target branch"
+	} else {
+		// Second step: select target branch and execute merge
+		m.MergeTarget = selectedBranch
+		repoPath := m.Projects[m.SelectedIndex]
+		err := gitMerge(repoPath, m.MergeSource, m.MergeTarget)
+		if err != nil {
+			m.Message = "Merge failed: " + err.Error()
+			m.ShowMergeDialog = false
 			return
 		}
-		m.Message = "Select target branch"
-		return
-	}
-
-	if m.MergeTarget == "" {
-		m.Message = "Select target branch"
-		return
-	}
-
-	// Execute merge
-	repoPath := m.Projects[m.SelectedIndex]
-	err := gitMerge(repoPath, m.MergeSource, m.MergeTarget)
-	if err != nil {
-		m.Message = "Merge failed: " + err.Error()
 		m.ShowMergeDialog = false
-		return
+		m.ShowPushPrompt = true
+		m.Message = "Merge successful! Push to remote?"
 	}
-
-	m.ShowMergeDialog = false
-	m.ShowPushPrompt = true
-	m.Message = "Merge successful! Push to remote?"
 }
 
 func (m *Model) handlePushResponse() {
+	pushed := false
 	if m.MergeSource == "yes" {
 		// Push target branch
 		repoPath := m.Projects[m.SelectedIndex]
@@ -338,13 +426,59 @@ func (m *Model) handlePushResponse() {
 			m.Message = "Push failed: " + err.Error()
 		} else {
 			m.Message = "Pushed successfully"
+			pushed = true
 		}
 	} else {
 		m.Message = "Merge completed (not pushed)"
 	}
+
+	// Save to history
+	history := MergeHistory{
+		ID:        fmt.Sprintf("%d", time.Now().Unix()),
+		Project:   m.Projects[m.SelectedIndex],
+		Source:    m.MergeSource,
+		Target:    m.MergeTarget,
+		Pushed:    pushed,
+		Timestamp: time.Now().Format("2006-01-02 15:04:05"),
+	}
+	err := AddHistory(m.ConfigDir, history)
+	if err == nil {
+		m.History, _ = LoadHistory(m.ConfigDir)
+	}
+
 	m.ShowPushPrompt = false
 	m.MergeSource = ""
 	m.MergeTarget = ""
+}
+
+func (m *Model) replayMerge() {
+	if m.HistoryIdx < 0 || m.HistoryIdx >= len(m.History) {
+		return
+	}
+
+	entry := m.History[m.HistoryIdx]
+	m.ShowHistory = false
+
+	// Execute merge
+	err := gitMerge(entry.Project, entry.Source, entry.Target)
+	if err != nil {
+		m.Message = "Replay merge failed: " + err.Error()
+		return
+	}
+
+	// If originally pushed, push again
+	if entry.Pushed {
+		err := gitPush(entry.Project, entry.Target)
+		if err != nil {
+			m.Message = "Replay push failed: " + err.Error()
+		} else {
+			m.Message = "Replay: merged and pushed successfully"
+		}
+	} else {
+		m.Message = "Replay: merged successfully (not pushed)"
+	}
+
+	m.ShowHistory = false
 }
 
 func (m *Model) getAllBranches() []string {
@@ -363,7 +497,7 @@ func (m *Model) getAllBranches() []string {
 // View implements tea.Model
 func (m Model) View() string {
 	// Header
-	header := headerStyle.Width(60).Render(" Git Worktree Manager ")
+	header := headerStyle.Width(80).Render(" Git Worktree Manager ")
 
 	// Project list panel
 	projectList := m.renderProjectList()
@@ -378,8 +512,22 @@ func (m Model) View() string {
 		worktreeList,
 	)
 
+	// History panel (if enabled)
+	if m.ShowHistory {
+		historyPanel := m.renderHistoryPanel()
+		panels = lipgloss.JoinHorizontal(
+			lipgloss.Top,
+			panels,
+			historyPanel,
+		)
+	}
+
 	// Help text
-	help := helpStyle.Render(" [n] Add project  [d] Delete  [m] Merge  [r] Refresh  [q] Quit ")
+	helpText := " [n] Add  [d] Delete  [m] Merge  [r] Refresh  [h] History  [q] Quit "
+	if m.ShowHistory {
+		helpText = " [↑/↓] Select  [Enter] Replay  [h] Close  [q] Quit "
+	}
+	help := helpStyle.Render(helpText)
 
 	// Message
 	msg := ""
@@ -405,14 +553,26 @@ func (m Model) View() string {
 		header,
 		panels,
 		help,
-		msg,
 	)
 
+	// Show dialog as overlay in center
 	if dialog != "" {
+		overlay := lipgloss.Place(
+			80, // terminal width
+			30, // terminal height
+			lipgloss.Center,
+			lipgloss.Center,
+			dialog,
+		)
+		return overlay
+	}
+
+	// Show message at bottom
+	if msg != "" {
 		mainContent = lipgloss.JoinVertical(
 			lipgloss.Left,
 			mainContent,
-			dialog,
+			msg,
 		)
 	}
 
@@ -480,35 +640,116 @@ func (m Model) renderWorktreeList() string {
 	return panelStyle.Width(50).Height(15).Render(content)
 }
 
-func (m Model) renderAddDialog() string {
-	dialogStyle := dialogBaseStyle.BorderForeground(primaryColor).Width(50)
+func (m Model) renderHistoryPanel() string {
+	title := lipgloss.NewStyle().Bold(true).Foreground(primaryColor).Render("History")
 
-	content := lipgloss.NewStyle().Bold(true).Foreground(primaryColor).Render("Add Project\n")
-	content += "\nEnter project path:\n"
-	content += lipgloss.NewStyle().Foreground(secondaryColor).Render("> " + m.NewProjectPath + "\n")
-	content += "\n" + helpStyle.Render("Press Tab to browse, Enter to add, Esc to cancel")
+	if len(m.History) == 0 {
+		content := title + "\n" + listItemStyle.Render(" (no history)")
+		return panelStyle.Width(40).Height(15).Render(content)
+	}
+
+	var items []string
+	for i, h := range m.History {
+		projectName := filepath.Base(h.Project)
+		pushStatus := "○"
+		if h.Pushed {
+			pushStatus = "✓"
+		}
+		line := fmt.Sprintf("%s %s → %s [%s]", projectName, h.Source, h.Target, pushStatus)
+		if i == m.HistoryIdx {
+			items = append(items, selectedItemStyle.Render(" "+line))
+		} else {
+			items = append(items, listItemStyle.Render(" "+line))
+		}
+	}
+
+	content := lipgloss.JoinVertical(
+		lipgloss.Left,
+		[]string{title}...,
+	)
+	content += "\n" + lipgloss.JoinVertical(lipgloss.Left, items...)
+
+	return panelStyle.Width(40).Height(15).Render(content)
+}
+
+func (m Model) renderAddDialog() string {
+	dialogStyle := dialogBaseStyle.BorderForeground(primaryColor).Width(60)
+
+	content := ">>> Add Project <<<\n\n"
+	content += "Enter project path:\n"
+	content += m.PathInput.View() + "\n"
+	content += "\n" + helpStyle.Render("Enter to add, Esc to cancel")
 
 	return dialogStyle.Render(content)
 }
 
 func (m Model) renderMergeDialog() string {
-	dialogStyle := dialogBaseStyle.BorderForeground(primaryColor).Width(50)
+	dialogStyle := dialogBaseStyle.BorderForeground(primaryColor).Width(90)
 
-	branches := m.getAllBranches()
-	content := lipgloss.NewStyle().Bold(true).Foreground(primaryColor).Render("Merge Branch\n")
-	content += "\nAvailable branches:\n"
+	allBranches := m.getAllBranches()
+	var availableBranches []string
 
-	for i, b := range branches {
+	stepText := "Select source branch"
+	if m.MergeDialogStep == 1 {
+		stepText = "Select target branch"
+		// Filter out the selected source branch
+		for _, b := range allBranches {
+			if b != m.MergeSource {
+				availableBranches = append(availableBranches, b)
+			}
+		}
+	} else {
+		availableBranches = allBranches
+	}
+
+	// Validate index
+	if len(availableBranches) > 0 {
+		if m.MergeDialogIdx < 0 {
+			m.MergeDialogIdx = 0
+		}
+		if m.MergeDialogIdx >= len(availableBranches) {
+			m.MergeDialogIdx = len(availableBranches) - 1
+		}
+	} else {
+		m.MergeDialogIdx = 0
+	}
+
+	// Left panel: show selected branch(es)
+	leftContent := ""
+	if m.MergeDialogStep == 0 {
+		leftContent = "Source:\n\n  (select a branch)"
+	} else {
+		leftContent = "Source:\n  " + m.MergeSource
+	}
+
+	// Right panel: show available branches
+	rightContent := ""
+	if m.MergeDialogStep == 0 {
+		rightContent = "Available:\n"
+	} else {
+		rightContent = "Select Target:\n"
+	}
+
+	for i, b := range availableBranches {
 		prefix := "  "
-		if i == 0 {
+		if i == m.MergeDialogIdx {
 			prefix = "> "
-			content += selectedItemStyle.Render(prefix+b) + "\n"
+			rightContent += selectedItemStyle.Render(prefix+b) + "\n"
 		} else {
-			content += listItemStyle.Render(prefix+b) + "\n"
+			rightContent += listItemStyle.Render(prefix+b) + "\n"
 		}
 	}
 
-	content += "\n" + helpStyle.Render("Use j/k to select, Enter to confirm")
+	// Build final content
+	var content string
+	content += ">>> Merge Branch <<<\n"
+	content += "Step: " + stepText + "\n\n"
+
+	// Side by side panels
+	leftPanel := lipgloss.NewStyle().Width(30).Render(leftContent)
+	rightPanel := lipgloss.NewStyle().Width(40).Render(rightContent)
+	content += lipgloss.JoinHorizontal(lipgloss.Top, leftPanel, rightPanel)
+	content += "\n\n" + helpStyle.Render("↑/↓ to select, Enter to confirm")
 
 	return dialogStyle.Render(content)
 }
@@ -541,6 +782,8 @@ func (m *Model) closeAllDialogs() {
 	m.ShowPushPrompt = false
 	m.ShowFilePicker = false
 	m.Message = ""
+	m.MergeDialogStep = 0
+	m.MergeDialogIdx = 0
 }
 
 func isGitRepo(path string) bool {
@@ -603,19 +846,16 @@ func getWorktrees(repoPath string) ([]Worktree, error) {
 }
 
 func getBranches(repoPath string) ([]string, error) {
-	cmd := exec.Command("git", "branch", "-a")
-	cmd.Dir = repoPath
-	output, err := cmd.Output()
+	// Only get branches from worktrees (exclude main/master)
+	worktrees, err := getWorktrees(repoPath)
 	if err != nil {
 		return nil, err
 	}
 
 	var branches []string
-	for _, line := range strings.Split(string(output), "\n") {
-		line = strings.TrimSpace(line)
-		line = strings.TrimPrefix(line, "* ")
-		if line != "" && !strings.HasPrefix(line, "remotes/") {
-			branches = append(branches, line)
+	for _, wt := range worktrees {
+		if wt.Branch != "" && !wt.IsMain {
+			branches = append(branches, wt.Branch)
 		}
 	}
 
@@ -623,22 +863,38 @@ func getBranches(repoPath string) ([]string, error) {
 }
 
 func gitMerge(repoPath, source, target string) error {
-	// First checkout to target branch
-	cmd := exec.Command("git", "checkout", target)
-	cmd.Dir = repoPath
-	if err := cmd.Run(); err != nil {
-		return err
+	// Find the worktree path for target branch
+	worktrees, err := getWorktrees(repoPath)
+	if err != nil {
+		return fmt.Errorf("failed to get worktrees: %v", err)
 	}
 
-	// Then merge source
+	var targetPath string
+	for _, wt := range worktrees {
+		if wt.Branch == target {
+			targetPath = wt.Path
+			break
+		}
+	}
+
+	// If target is main/master, use repoPath
+	if targetPath == "" {
+		targetPath = repoPath
+	}
+
+	// Merge source into target branch in the target's worktree
+	cmd := exec.Command("git", "fetch", ".")
+	cmd.Dir = targetPath
+	cmd.Run() // ignore fetch errors
+
 	cmd = exec.Command("git", "merge", source)
-	cmd.Dir = repoPath
-	if err := cmd.Run(); err != nil {
+	cmd.Dir = targetPath
+	if out, err := cmd.CombinedOutput(); err != nil {
 		// If merge failed, try to abort
 		abortCmd := exec.Command("git", "merge", "--abort")
-		abortCmd.Dir = repoPath
+		abortCmd.Dir = targetPath
 		abortCmd.Run()
-		return err
+		return fmt.Errorf("merge failed: %s", string(out))
 	}
 
 	return nil

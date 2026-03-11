@@ -64,3 +64,55 @@ func saveProjects(configDir string, projects []string) error {
 
 	return nil
 }
+
+func LoadHistory(configDir string) ([]MergeHistory, error) {
+	historyPath := filepath.Join(configDir, "history.json")
+
+	data, err := os.ReadFile(historyPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return []MergeHistory{}, nil
+		}
+		return nil, err
+	}
+
+	var history []MergeHistory
+	err = json.Unmarshal(data, &history)
+	if err != nil {
+		return nil, err
+	}
+
+	return history, nil
+}
+
+func SaveHistory(configDir string, history []MergeHistory) error {
+	historyPath := filepath.Join(configDir, "history.json")
+
+	data, err := json.MarshalIndent(history, "", "  ")
+	if err != nil {
+		return err
+	}
+
+	err = os.WriteFile(historyPath, data, 0644)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func AddHistory(configDir string, entry MergeHistory) error {
+	history, err := LoadHistory(configDir)
+	if err != nil {
+		history = []MergeHistory{}
+	}
+
+	history = append([]MergeHistory{entry}, history...)
+
+	// Keep only last 50 entries
+	if len(history) > 50 {
+		history = history[:50]
+	}
+
+	return SaveHistory(configDir, history)
+}
