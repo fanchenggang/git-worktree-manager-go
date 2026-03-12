@@ -1,0 +1,6 @@
+
+给Projects 右侧添加序号从1 开始 支持数字快捷键跳到对应的项目 并且自动refresh
+在 Merge Wizard 中按分支的最近变化排序
+
+Merge Wizard中source分支 把develop分支或者以_develop结尾的分支或者以-develop结尾的分支排在最后 target分支 把develop分支或者以_develop结尾的分支或者以-develop结尾的分支排在最前 并且默认选中
+
